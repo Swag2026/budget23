@@ -508,3 +508,28 @@ class AuditLog(Base):
     entity_id = Column(UUID(as_uuid=False))
     diff = Column(JSONB)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+# ============================================================================
+# APP STATE (full-blob sync for the original single-file HTML app)
+# ============================================================================
+# The original app keeps its entire working data (companies, years, budgets,
+# decisions, strategy, org chart, users, etc.) in one big in-memory `DB`
+# object, persisted via localStorage. Rather than rewriting every UI
+# touchpoint to call 30 normalized endpoints, we store/retrieve that same
+# JSON blob here. This is a pragmatic bridge — the normalized tables above
+# remain available for future reporting/querying, but the live app talks to
+# this single blob for now.
+#
+# It's a SHARED workspace blob (key='main'), not per-user — the whole team
+# (admin/gm/finance/sales/hr) collaborates on the same data, exactly like the
+# original app's single shared DB. Any authenticated user can read/write it;
+# last write wins (same behavior as the original localStorage version, just
+# now centralized instead of trapped in one browser).
+class AppState(Base):
+    __tablename__ = "app_state"
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    key = Column(String(50), nullable=False, unique=True, default="main")
+    data = Column(JSONB, nullable=False, default=dict)
+    updated_by = Column(UUID(as_uuid=False), ForeignKey("users.id"))
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())

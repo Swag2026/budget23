@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+import os
+from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -186,3 +187,56 @@ def get_decision(decision_id: str, db: Session = Depends(get_db), current_user: 
 @app.get("/")
 def root():
     return {"status": "ok", "service": "budget-planning-api"}
+
+
+# ============================================================================
+# ONE-TIME SEED (browser-triggerable, no CLI needed)
+# Visit https://<your-backend-url>/admin/seed?key=<SEED_KEY> once after first
+# deploy to populate default company/users/decision data. Safe to re-visit —
+# it checks whether seeding already happened and skips if so.
+# ============================================================================
+
+SEED_KEY = os.getenv("SEED_KEY", "change-me-seed-key")
+
+
+@app.get("/admin/seed")
+def run_seed(key: str, db: Session = Depends(get_db)):
+    if key != SEED_KEY:
+        raise HTTPException(status_code=403, detail="Invalid seed key")
+    import seed as seed_module
+    try:
+        seed_module.run()
+        return {"status": "ok", "message": "Seed completed (or already existed — check details below)."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ============================================================================
+# APP STATE (full-blob sync — see AppState model docstring in models.py)
+# This is what the original HTML app's load()/save() now call instead of
+# localStorage.getItem/setItem.
+# ============================================================================
+
+STATE_KEY = "main"
+
+
+@app.get("/state")
+def get_state(db: Session = Depends(get_db), current_user: m.User = Depends(get_current_user)):
+    state = db.query(m.AppState).filter_by(key=STATE_KEY).first()
+    if not state:
+        return {"data": None}
+    return {"data": state.data, "updated_at": state.updated_at.isoformat() if state.updated_at else None}
+
+
+@app.put("/state")
+def put_state(payload: dict = Body(...), db: Session = Depends(get_db),
+              current_user: m.User = Depends(get_current_user)):
+    state = db.query(m.AppState).filter_by(key=STATE_KEY).first()
+    if not state:
+        state = m.AppState(key=STATE_KEY, data=payload, updated_by=current_user.id)
+        db.add(state)
+    else:
+        state.data = payload
+        state.updated_by = current_user.id
+    db.commit()
+    return {"status": "ok"}
