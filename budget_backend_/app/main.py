@@ -388,6 +388,25 @@ def emergency_unlock(key: str, username: str, db: Session = Depends(get_db)):
     return {"status": "ok", "message": f"User '{username}' reactivated."}
 
 
+@app.get("/admin/emergency-reset-password")
+def emergency_reset_password(key: str, username: str, new_password: str, db: Session = Depends(get_db)):
+    # Same idea as emergency-unlock, but resets the password directly — for
+    # total lockouts where the password itself is the problem, not just the
+    # active flag. Protected by SEED_KEY only (no login needed, since the
+    # whole point is you can't log in).
+    if key != SEED_KEY:
+        raise HTTPException(status_code=403, detail="Invalid key")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    target = db.query(m.User).filter_by(username=username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"No login account found for username '{username}'")
+    target.active = True
+    target.password_hash = hash_password(new_password)
+    db.commit()
+    return {"status": "ok", "message": f"Password for '{username}' reset and account reactivated."}
+
+
 # ============================================================================
 # APP STATE (full-blob sync — see AppState model docstring in models.py)
 # This is what the original HTML app's load()/save() now call instead of
