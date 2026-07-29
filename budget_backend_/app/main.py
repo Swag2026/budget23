@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException, status, Body
+from fastapi import FastAPI, Depends, HTTPException, status, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -8,20 +8,26 @@ from pydantic import BaseModel
 
 from . import models as m
 from .database import get_db, engine, Base
-from .auth import verify_password, create_access_token, decode_access_token
+from .auth import verify_password, hash_password, create_access_token, decode_access_token
 
 app = FastAPI(title="نظام الموازنات التقديرية والتخطيط المالي — API")
 
-# In production, replace "*" with your actual Netlify domain(s).
+# Restricted to known frontend origins. Add more Netlify/custom domains here as needed.
+ALLOWED_ORIGINS = [
+    "https://clever-semolina-d36545.netlify.app",
+    "http://localhost:3000",   # local dev
+    "http://localhost:5173",   # local dev (vite)
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
 
 @app.on_event("startup")
@@ -34,9 +40,13 @@ def on_startup():
 # AUTH
 # ============================================================================
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> m.User:
+def get_current_user(token: Optional[str] = Depends(oauth2_scheme), token_qs: Optional[str] = None,
+                      db: Session = Depends(get_db)) -> m.User:
+    tok = token or token_qs
+    if not tok:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = decode_access_token(token)
+        payload = decode_access_token(tok)
         user_id = payload.get("sub")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -72,6 +82,108 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 @app.get("/auth/me")
 def me(current_user: m.User = Depends(get_current_user)):
     return {"id": current_user.id, "username": current_user.username, "name": current_user.name}
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def change_password(payload: ChangePasswordIn, db: Session = Depends(get_db),
+                     current_user: m.User = Depends(get_current_user)):
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="كلمة المرور الحالية غير صحيحة")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل")
+    current_user.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"status": "ok", "message": "تم تغيير كلمة المرور بنجاح"}
+
+
+# ============================================================================
+# ADMIN: USER MANAGEMENT
+# The app's own "Users" screen only edited the shared DB blob (role/section
+# display data) — it never touched real backend login credentials. These
+# endpoints let admin/gm users actually create/reset/deactivate the real
+# login accounts, wired up from the frontend's user-management screen.
+# ============================================================================
+
+def require_admin_or_gm(db: Session, current_user: m.User) -> m.UserCompany:
+    link = (db.query(m.UserCompany)
+            .filter(m.UserCompany.user_id == current_user.id)
+            .filter(m.UserCompany.role.in_([m.UserRole.admin, m.UserRole.gm]))
+            .first())
+    if not link:
+        raise HTTPException(status_code=403, detail="هذا الإجراء متاح فقط لمدير النظام أو المدير العام")
+    return link
+
+
+class CreateUserIn(BaseModel):
+    username: str
+    password: str
+    name: str
+    role: str = "staff"
+
+
+@app.post("/admin/users")
+def admin_create_user(payload: CreateUserIn, db: Session = Depends(get_db),
+                       current_user: m.User = Depends(get_current_user)):
+    link = require_admin_or_gm(db, current_user)
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+    existing = db.query(m.User).filter_by(username=payload.username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="اسم المستخدم مُستخدَم بالفعل في نظام الدخول")
+    role = payload.role if payload.role in ("admin", "gm", "finance", "staff") else "staff"
+    u = m.User(username=payload.username, name=payload.name, password_hash=hash_password(payload.password))
+    db.add(u)
+    db.flush()
+    db.add(m.UserCompany(user_id=u.id, company_id=link.company_id, role=role))
+    db.commit()
+    return {"status": "ok", "id": u.id}
+
+
+class ResetPasswordIn(BaseModel):
+    username: str
+    new_password: str
+
+
+@app.post("/admin/users/reset-password")
+def admin_reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db),
+                          current_user: m.User = Depends(get_current_user)):
+    require_admin_or_gm(db, current_user)
+    if len(payload.new_password) < 6:
+        raise HTTPException(status_code=400, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+    target = db.query(m.User).filter_by(username=payload.username).first()
+    if not target:
+        # لا يوجد حساب دخول حقيقي بهذا الاسم بعد — أنشئه بدل الفشل الصامت
+        target = m.User(username=payload.username, name=payload.username, password_hash=hash_password(payload.new_password))
+        db.add(target)
+        db.flush()
+        link = require_admin_or_gm(db, current_user)
+        db.add(m.UserCompany(user_id=target.id, company_id=link.company_id, role="staff"))
+    else:
+        target.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"status": "ok"}
+
+
+class DeactivateUserIn(BaseModel):
+    username: str
+    active: bool = False
+
+
+@app.post("/admin/users/set-active")
+def admin_set_active(payload: DeactivateUserIn, db: Session = Depends(get_db),
+                      current_user: m.User = Depends(get_current_user)):
+    require_admin_or_gm(db, current_user)
+    target = db.query(m.User).filter_by(username=payload.username).first()
+    if not target:
+        return {"status": "ok", "note": "no matching backend login account (nothing to deactivate)"}
+    target.active = payload.active
+    db.commit()
+    return {"status": "ok"}
 
 
 # ============================================================================
@@ -126,8 +238,13 @@ def get_sales_budget(budget_year_id: str, branch_id: str, db: Session = Depends(
 @app.put("/budget-years/{budget_year_id}/sales/{branch_id}")
 def upsert_sales_budget(budget_year_id: str, branch_id: str, payload: SalesBudgetIn,
                          db: Session = Depends(get_db), current_user: m.User = Depends(get_current_user)):
-    # NOTE: add RBAC check here — e.g. verify current_user's UserCompany.can_edit
-    # is True for this budget_year's company before allowing writes.
+    by = db.query(m.BudgetYear).filter_by(id=budget_year_id).first()
+    if not by:
+        raise HTTPException(status_code=404, detail="Budget year not found")
+    link = db.query(m.UserCompany).filter_by(user_id=current_user.id, company_id=by.company_id).first()
+    if not link or not (link.can_edit or link.role in ("admin", "gm")):
+        raise HTTPException(status_code=403, detail="ليس لديك صلاحية التعديل على هذه البيانات")
+
     sb = db.query(m.SalesBudget).filter_by(budget_year_id=budget_year_id, branch_id=branch_id).first()
     if not sb:
         sb = m.SalesBudget(budget_year_id=budget_year_id, branch_id=branch_id)
@@ -203,10 +320,14 @@ SEED_KEY = os.getenv("SEED_KEY", "change-me-seed-key")
 def run_seed(key: str, db: Session = Depends(get_db)):
     if key != SEED_KEY:
         raise HTTPException(status_code=403, detail="Invalid seed key")
+    # Already seeded? Don't re-run or leak whether seeding is possible again.
+    existing = db.query(m.Company).filter_by(name="شركة لاروش التجارية").first()
+    if existing:
+        return {"status": "already_seeded", "message": "تم إعداد البيانات مسبقاً. لا حاجة لتكرار هذا."}
     import seed as seed_module
     try:
         seed_module.run()
-        return {"status": "ok", "message": "Seed completed (or already existed — check details below)."}
+        return {"status": "ok", "message": "Seed completed. IMPORTANT: change default passwords now via /auth/change-password, then remove/rotate SEED_KEY."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -224,19 +345,57 @@ STATE_KEY = "main"
 def get_state(db: Session = Depends(get_db), current_user: m.User = Depends(get_current_user)):
     state = db.query(m.AppState).filter_by(key=STATE_KEY).first()
     if not state:
-        return {"data": None}
-    return {"data": state.data, "updated_at": state.updated_at.isoformat() if state.updated_at else None}
+        return {"data": None, "version": None}
+    return {"data": state.data, "version": state.updated_at.isoformat() if state.updated_at else None}
 
 
 @app.put("/state")
-def put_state(payload: dict = Body(...), db: Session = Depends(get_db),
-              current_user: m.User = Depends(get_current_user)):
+def put_state(payload: dict = Body(...), expected_version: Optional[str] = None,
+              db: Session = Depends(get_db), current_user: m.User = Depends(get_current_user)):
     state = db.query(m.AppState).filter_by(key=STATE_KEY).first()
     if not state:
         state = m.AppState(key=STATE_KEY, data=payload, updated_by=current_user.id)
         db.add(state)
     else:
+        # Optimistic concurrency: if the caller knows what version they last read,
+        # and the server has moved on since then, someone else saved in between —
+        # reject instead of silently overwriting their change.
+        current_version = state.updated_at.isoformat() if state.updated_at else None
+        if expected_version and current_version and expected_version != current_version:
+            raise HTTPException(
+                status_code=409,
+                detail="تم تعديل البيانات من جهاز آخر منذ آخر تحميل. أعد تحميل الصفحة قبل الحفظ.",
+            )
         state.data = payload
         state.updated_by = current_user.id
+    db.commit()
+    db.refresh(state)
+    return {"status": "ok", "version": state.updated_at.isoformat() if state.updated_at else None}
+
+
+@app.post("/state/beacon")
+async def put_state_beacon(request: Request, token_qs: Optional[str] = None, db: Session = Depends(get_db)):
+    # navigator.sendBeacon only supports POST and can't set custom headers, so the
+    # frontend calls this endpoint (with the token as a query param) as a
+    # best-effort save when the tab is closing. No conflict check here — this is
+    # a last-resort flush, not the primary save path.
+    if not token_qs:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload_obj = decode_access_token(token_qs)
+        user_id = payload_obj.get("sub")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(m.User).filter(m.User.id == user_id, m.User.active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    body = await request.json()
+    state = db.query(m.AppState).filter_by(key=STATE_KEY).first()
+    if not state:
+        state = m.AppState(key=STATE_KEY, data=body, updated_by=user.id)
+        db.add(state)
+    else:
+        state.data = body
+        state.updated_by = user.id
     db.commit()
     return {"status": "ok"}
