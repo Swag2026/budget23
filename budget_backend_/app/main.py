@@ -201,9 +201,27 @@ class DeactivateUserIn(BaseModel):
 def admin_set_active(payload: DeactivateUserIn, db: Session = Depends(get_db),
                       current_user: m.User = Depends(get_current_user)):
     require_admin_or_gm(db, current_user)
+    if payload.username == current_user.username and not payload.active:
+        raise HTTPException(status_code=400, detail="لا يمكنك تعطيل حسابك الخاص أثناء تسجيل الدخول به — سجّل دخولاً بحساب آخر أولاً")
     target = db.query(m.User).filter_by(username=payload.username).first()
     if not target:
         return {"status": "ok", "note": "no matching backend login account (nothing to deactivate)"}
+    if not payload.active:
+        # حماية: لا تسمح بتعطيل آخر حساب دخول نشط بصلاحية admin/gm — حتى لو
+        # طُلب ذلك بالخطأ من الواجهة، لتفادي القفل الكامل خارج النظام
+        target_link = (db.query(m.UserCompany)
+                       .filter(m.UserCompany.user_id == target.id)
+                       .filter(m.UserCompany.role.in_([m.UserRole.admin, m.UserRole.gm]))
+                       .first())
+        if target_link:
+            other_active_admins = (db.query(m.User)
+                                    .join(m.UserCompany, m.UserCompany.user_id == m.User.id)
+                                    .filter(m.UserCompany.role.in_([m.UserRole.admin, m.UserRole.gm]))
+                                    .filter(m.User.active == True)
+                                    .filter(m.User.id != target.id)
+                                    .count())
+            if other_active_admins == 0:
+                raise HTTPException(status_code=400, detail="لا يمكن تعطيل آخر حساب دخول نشط بصلاحية مدير/مدير عام")
     target.active = payload.active
     db.commit()
     return {"status": "ok"}
@@ -353,6 +371,21 @@ def run_seed(key: str, db: Session = Depends(get_db)):
         return {"status": "ok", "message": "Seed completed. IMPORTANT: change default passwords now via /auth/change-password, then remove/rotate SEED_KEY."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/admin/emergency-unlock")
+def emergency_unlock(key: str, username: str, db: Session = Depends(get_db)):
+    # Escape hatch for accidental lockouts (e.g. an admin account getting
+    # deactivated). Protected by the same SEED_KEY. Re-activates the given
+    # backend login account.
+    if key != SEED_KEY:
+        raise HTTPException(status_code=403, detail="Invalid key")
+    target = db.query(m.User).filter_by(username=username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"No login account found for username '{username}'")
+    target.active = True
+    db.commit()
+    return {"status": "ok", "message": f"User '{username}' reactivated."}
 
 
 # ============================================================================
