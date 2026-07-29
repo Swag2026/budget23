@@ -12,9 +12,10 @@ from .auth import verify_password, hash_password, create_access_token, decode_ac
 
 app = FastAPI(title="نظام الموازنات التقديرية والتخطيط المالي — API")
 
-# Restricted to known frontend origins. Add more Netlify/custom domains here as needed.
+# Restricted to known frontend origins. Add more Netlify/Cloudflare/custom domains here as needed.
 ALLOWED_ORIGINS = [
     "https://clever-semolina-d36545.netlify.app",
+    "https://budget234.cloud-admin-847.workers.dev",
     "http://localhost:3000",   # local dev
     "http://localhost:5173",   # local dev (vite)
 ]
@@ -165,6 +166,28 @@ def admin_reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)
         db.add(m.UserCompany(user_id=target.id, company_id=link.company_id, role="staff"))
     else:
         target.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"status": "ok"}
+
+
+class RenameUserIn(BaseModel):
+    old_username: str
+    new_username: str
+
+
+@app.post("/admin/users/rename")
+def admin_rename_user(payload: RenameUserIn, db: Session = Depends(get_db),
+                       current_user: m.User = Depends(get_current_user)):
+    require_admin_or_gm(db, current_user)
+    if payload.old_username == payload.new_username:
+        return {"status": "ok"}
+    target = db.query(m.User).filter_by(username=payload.old_username).first()
+    if not target:
+        return {"status": "ok", "note": "no matching backend login account (nothing to rename)"}
+    clash = db.query(m.User).filter_by(username=payload.new_username).first()
+    if clash:
+        raise HTTPException(status_code=400, detail="اسم المستخدم الجديد مُستخدَم بالفعل")
+    target.username = payload.new_username
     db.commit()
     return {"status": "ok"}
 
